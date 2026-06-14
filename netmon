@@ -1,0 +1,2508 @@
+#!/usr/bin/env python3
+"""
+Application-Level Network Usage Monitor (NetMon)
+A lightweight, single-file network traffic daemon, logger, and web dashboard.
+Runs on Linux, tracks traffic per process/user/container, and stores hourly/daily/monthly summaries.
+"""
+
+import os
+import sys
+import subprocess
+
+# Self-installing dependencies list
+REQUIRED_PACKAGES = ["fastapi", "uvicorn", "websockets"]
+
+def auto_install_packages():
+    missing = []
+    for pkg in REQUIRED_PACKAGES:
+        try:
+            __import__(pkg)
+        except ImportError:
+            missing.append(pkg)
+    if missing:
+        print(f"Missing required Python libraries: {missing}. Installing automatically...", flush=True)
+        try:
+            # Execute pip install inside current Python interpreter environment
+            # We attempt to use --break-system-packages to override Debian/Ubuntu PEP 668 lockouts
+            cmd = [sys.executable, "-m", "pip", "install"]
+            try:
+                subprocess.check_call(cmd + ["--break-system-packages", *missing])
+            except subprocess.CalledProcessError:
+                # Fallback to standard installation if flag is unsupported
+                subprocess.check_call(cmd + missing)
+            print("Dependencies installed successfully! Resuming startup...", flush=True)
+        except Exception as e:
+            print(f"Error: Automatic installation failed: {e}. Please install manually using: pip install " + " ".join(missing), file=sys.stderr, flush=True)
+            sys.exit(1)
+
+auto_install_packages()
+
+import re
+import time
+import json
+import socket
+import struct
+import sqlite3
+import logging
+import threading
+import pwd
+import collections
+import csv
+import io
+import asyncio
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, StreamingResponse
+
+# Setup logger
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("NetMon")
+
+# Configuration settings
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "netmon.db")
+SETTINGS = {
+    'alert_threshold_mb_s': 10.0,
+    'check_unknown_process': True,
+    'alert_unknown_process_threshold_mb_s': 1.0
+}
+
+# Global threads termination signal
+stop_event = threading.Event()
+# Notify proc scanner that there is a new unknown inode
+proc_scan_event = threading.Event()
+# Notify socket scanner that we missed a socket in active_sockets
+socket_scan_event = threading.Event()
+
+# In-memory mapping states
+active_sockets = {}         # key: (local_ip, local_port, remote_ip, remote_port, proto) -> (inode, uid)
+inode_to_proc = {}          # key: inode -> { 'pid': pid, 'name': name, 'user': user, 'container': container }
+pid_cache = {}              # key: pid -> (name, user, container)
+container_name_cache = {}   # key: container_id -> container_name
+uid_to_username = {}        # key: uid -> username
+
+# Active traffic accumulations
+traffic_lock = threading.Lock()
+second_accumulator = {}     # key: (name, user, container) -> { 'sent': bytes, 'recv': bytes, 'pid': pid }
+minute_accumulator = {}     # key: (name, user, container) -> { 'sent': bytes, 'recv': bytes }
+active_connections_accumulator = {} # key: (src_ip, src_port, dst_ip, dst_port, proto, name) -> { 'sent': bytes, 'recv': bytes }
+
+# Historical tracking lists
+realtime_history = collections.deque(maxlen=60)
+active_connections_history = {}
+alert_cache = {}
+
+session_total_bytes = 0
+
+# FastAPI references
+main_loop = None
+active_websockets = set()
+
+# Helper: format byte counts
+def format_bytes(b):
+    if b >= 1024 * 1024 * 1024:
+        return f"{b / (1024 * 1024 * 1024):.2f} GB"
+    elif b >= 1024 * 1024:
+        return f"{b / (1024 * 1024):.2f} MB"
+    elif b >= 1024:
+        return f"{b / 1024:.2f} KB"
+    else:
+        return f"{b} B"
+
+def format_speed(b_s):
+    return f"{format_bytes(b_s)}/s"
+
+# Helper: parse UID to Username
+def get_username(uid):
+    if uid in uid_to_username:
+        return uid_to_username[uid]
+    try:
+        username = pwd.getpwuid(uid).pw_name
+    except Exception:
+        username = str(uid)
+    uid_to_username[uid] = username
+    return username
+
+# Helper: parse Linux connection addresses in hex
+def parse_ipv4_hex(hex_str):
+    ip_bytes = bytes.fromhex(hex_str)
+    return socket.inet_ntoa(ip_bytes[::-1])
+
+def parse_ipv6_hex(hex_str):
+    ip_bytes = bytes.fromhex(hex_str)
+    reversed_blocks = []
+    for i in range(0, 32, 8):
+        block = ip_bytes[i:i+4]
+        reversed_blocks.append(block[::-1])
+    return socket.inet_ntop(socket.AF_INET6, b''.join(reversed_blocks))
+
+def parse_hex_addr(hex_addr, is_ipv6):
+    parts = hex_addr.split(':')
+    if len(parts) != 2:
+        raise ValueError("Invalid address hex format")
+    ip_hex, port_hex = parts
+    port = int(port_hex, 16)
+    if is_ipv6:
+        ip = parse_ipv6_hex(ip_hex)
+    else:
+        ip = parse_ipv4_hex(ip_hex)
+    return ip, port
+
+def parse_proc_net_line(line, is_ipv6=False):
+    parts = line.strip().split()
+    if len(parts) < 10:
+        return None
+    try:
+        local_ip, local_port = parse_hex_addr(parts[1], is_ipv6)
+        remote_ip, remote_port = parse_hex_addr(parts[2], is_ipv6)
+        inode = int(parts[9])
+        uid = int(parts[7])
+        state = parts[3]
+        return {
+            'local_ip': local_ip,
+            'local_port': local_port,
+            'remote_ip': remote_ip,
+            'remote_port': remote_port,
+            'inode': inode,
+            'uid': uid,
+            'state': state
+        }
+    except Exception:
+        return None
+
+# Helper: Docker Container resolver via Unix Socket HTTP API
+def resolve_docker_container_name(container_id):
+    if not container_id:
+        return None
+    if container_id in container_name_cache:
+        return container_name_cache[container_id]
+        
+    # Standard Unix socket request
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(0.1)
+        s.connect("/var/run/docker.sock")
+        request = f"GET /containers/{container_id}/json HTTP/1.0\r\n\r\n"
+        s.sendall(request.encode())
+        response = b""
+        while True:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            response += chunk
+        s.close()
+        parts = response.split(b"\r\n\r\n", 1)
+        if len(parts) == 2:
+            header, body = parts
+            if b"200 OK" in header:
+                info = json.loads(body.decode())
+                name = info.get("Name", "").lstrip("/")
+                container_name_cache[container_id] = name
+                return name
+    except Exception:
+        pass
+        
+    short_id = container_id[:12]
+    container_name_cache[container_id] = short_id
+    return short_id
+
+# Helper: parse PID cgroup container ID
+def extract_container_id(cgroup_content):
+    match = re.search(r'/docker/([0-9a-fA-F]{64})', cgroup_content)
+    if match:
+        return match.group(1)
+    match = re.search(r'/libpod-([0-9a-fA-F]{64})', cgroup_content)
+    if match:
+        return match.group(1)
+    match = re.search(r'docker-([0-9a-fA-F]{64})\.scope', cgroup_content)
+    if match:
+        return match.group(1)
+    return None
+
+# Database Management
+class DBManager:
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self.init_db()
+        
+    def init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Raw table: holds 1-minute aggregates, pruned after 24 hours
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS traffic_raw (
+                timestamp INTEGER,
+                name TEXT,
+                user TEXT,
+                container TEXT,
+                bytes_sent INTEGER,
+                bytes_recv INTEGER
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_raw_time ON traffic_raw(timestamp)')
+        
+        # Hourly table with unique constraints, pruned after 30 days
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS traffic_hourly (
+                timestamp INTEGER,
+                name TEXT,
+                user TEXT,
+                container TEXT,
+                bytes_sent INTEGER,
+                bytes_recv INTEGER
+            )
+        ''')
+        cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_hourly_unique ON traffic_hourly(timestamp, name, user, container)')
+        
+        # Daily table with unique constraints, pruned after 365 days
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS traffic_daily (
+                timestamp INTEGER,
+                name TEXT,
+                user TEXT,
+                container TEXT,
+                bytes_sent INTEGER,
+                bytes_recv INTEGER
+            )
+        ''')
+        cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_unique ON traffic_daily(timestamp, name, user, container)')
+        
+        # Monthly table with unique constraints, kept forever
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS traffic_monthly (
+                timestamp INTEGER,
+                name TEXT,
+                user TEXT,
+                container TEXT,
+                bytes_sent INTEGER,
+                bytes_recv INTEGER
+            )
+        ''')
+        cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_monthly_unique ON traffic_monthly(timestamp, name, user, container)')
+        
+        # Alerts table
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS alerts (
+                timestamp INTEGER,
+                process_name TEXT,
+                message TEXT,
+                severity TEXT
+            )
+        ''')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_alerts_time ON alerts(timestamp)')
+        
+        conn.commit()
+        conn.close()
+
+    def write_raw_batch(self, batch):
+        if not batch:
+            return
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.executemany('''
+            INSERT INTO traffic_raw (timestamp, name, user, container, bytes_sent, bytes_recv)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', batch)
+        conn.commit()
+        conn.close()
+        
+    def rollup_and_prune(self):
+        now = int(time.time())
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            # 1. Rollup raw to hourly (older than 1 hour)
+            one_hour_ago = now - 3600
+            cursor.execute('''
+                INSERT OR REPLACE INTO traffic_hourly (timestamp, name, user, container, bytes_sent, bytes_recv)
+                SELECT (timestamp / 3600) * 3600, name, user, container, SUM(bytes_sent), SUM(bytes_recv)
+                FROM traffic_raw
+                WHERE timestamp <= ?
+                GROUP BY (timestamp / 3600) * 3600, name, user, container
+            ''', (one_hour_ago,))
+            
+            # Prune raw older than 24 hours
+            twenty_four_hours_ago = now - 86400
+            cursor.execute('DELETE FROM traffic_raw WHERE timestamp <= ?', (twenty_four_hours_ago,))
+            
+            # 2. Rollup hourly to daily (older than 1 day)
+            one_day_ago = now - 86400
+            cursor.execute('''
+                INSERT OR REPLACE INTO traffic_daily (timestamp, name, user, container, bytes_sent, bytes_recv)
+                SELECT (timestamp / 86400) * 86400, name, user, container, SUM(bytes_sent), SUM(bytes_recv)
+                FROM traffic_hourly
+                WHERE timestamp <= ?
+                GROUP BY (timestamp / 86400) * 86400, name, user, container
+            ''', (one_day_ago,))
+            
+            # Prune hourly older than 30 days
+            thirty_days_ago = now - 2592000
+            cursor.execute('DELETE FROM traffic_hourly WHERE timestamp <= ?', (thirty_days_ago,))
+            
+            # 3. Rollup daily to monthly (older than 30 days)
+            cursor.execute('''
+                INSERT OR REPLACE INTO traffic_monthly (timestamp, name, user, container, bytes_sent, bytes_recv)
+                SELECT 
+                    cast(strftime('%s', strftime('%Y-%m-01 00:00:00', datetime(timestamp, 'unixepoch'))) as integer),
+                    name, user, container, SUM(bytes_sent), SUM(bytes_recv)
+                FROM traffic_daily
+                WHERE timestamp <= ?
+                GROUP BY 
+                    strftime('%Y-%m', datetime(timestamp, 'unixepoch')),
+                    name, user, container
+            ''', (thirty_days_ago,))
+            
+            # Prune daily older than 365 days
+            three_hundred_sixty_five_days_ago = now - 31536000
+            cursor.execute('DELETE FROM traffic_daily WHERE timestamp <= ?', (three_hundred_sixty_five_days_ago,))
+            
+            conn.commit()
+            logger.info("Database rollup and pruning run completed successfully.")
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Database rollup transactional failure: {e}")
+        finally:
+            conn.close()
+
+    def get_history(self, range_str):
+        now = int(time.time())
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        if range_str == '24h':
+            cutoff = now - 86400
+            cursor.execute('''
+                SELECT timestamp, name, user, container, bytes_sent, bytes_recv
+                FROM traffic_raw
+                WHERE timestamp >= ?
+                ORDER BY timestamp ASC
+            ''', (cutoff,))
+        elif range_str == '7d':
+            cutoff = now - 7 * 86400
+            cursor.execute('''
+                SELECT timestamp, name, user, container, bytes_sent, bytes_recv
+                FROM traffic_hourly
+                WHERE timestamp >= ?
+                ORDER BY timestamp ASC
+            ''', (cutoff,))
+        elif range_str == '30d':
+            cutoff = now - 30 * 86400
+            cursor.execute('''
+                SELECT timestamp, name, user, container, bytes_sent, bytes_recv
+                FROM traffic_daily
+                WHERE timestamp >= ?
+                ORDER BY timestamp ASC
+            ''', (cutoff,))
+        else:
+            cursor.execute('''
+                SELECT timestamp, name, user, container, bytes_sent, bytes_recv
+                FROM traffic_monthly
+                ORDER BY timestamp ASC
+            ''')
+            
+        rows = cursor.fetchall()
+        result = [dict(row) for row in rows]
+        conn.close()
+        return result
+
+    def get_top_consumers(self, range_str, limit=20):
+        now = int(time.time())
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        
+        table = "traffic_monthly"
+        cutoff = 0
+        if range_str == '24h':
+            table = "traffic_raw"
+            cutoff = now - 86400
+        elif range_str == '7d':
+            table = "traffic_hourly"
+            cutoff = now - 7 * 86400
+        elif range_str == '30d':
+            table = "traffic_daily"
+            cutoff = now - 30 * 86400
+            
+        query = f'''
+            SELECT name, user, container, SUM(bytes_sent) as sent, SUM(bytes_recv) as recv, SUM(bytes_sent + bytes_recv) as total
+            FROM {table}
+            WHERE timestamp >= ?
+            GROUP BY name, user, container
+            ORDER BY total DESC
+            LIMIT ?
+        '''
+        cursor.execute(query, (cutoff, limit))
+        rows = cursor.fetchall()
+        result = [dict(row) for row in rows]
+        conn.close()
+        return result
+
+    def get_alerts(self, limit=50):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('SELECT timestamp, process_name, message, severity FROM alerts ORDER BY timestamp DESC LIMIT ?', (limit,))
+        rows = cursor.fetchall()
+        result = [dict(row) for row in rows]
+        conn.close()
+        return result
+
+db_manager = DBManager(DB_PATH)
+
+# Scan /proc for sockets and map PIDs
+def scan_proc_fds():
+    global inode_to_proc
+    new_inode_to_proc = {}
+    
+    try:
+        pids = [d for d in os.listdir('/proc') if d.isdigit()]
+    except Exception as e:
+        logger.error(f"Cannot read /proc: {e}")
+        return
+        
+    current_pids_set = set(int(p) for p in pids)
+    # Evict dead PIDs from cache
+    for cached_pid in list(pid_cache.keys()):
+        if cached_pid not in current_pids_set:
+            pid_cache.pop(cached_pid, None)
+            
+    for pid_str in pids:
+        pid = int(pid_str)
+        proc_name = "unknown"
+        uid = 0
+        container_name = None
+        
+        if pid in pid_cache:
+            proc_name, user, container_name = pid_cache[pid]
+        else:
+            try:
+                with open(f'/proc/{pid_str}/comm', 'r') as f:
+                    proc_name = f.read().strip()
+                if not proc_name:
+                    with open(f'/proc/{pid_str}/cmdline', 'r') as f:
+                        cmd = f.read().strip().split('\x00')[0]
+                        if cmd:
+                            proc_name = os.path.basename(cmd)
+            except Exception:
+                pass
+                
+            try:
+                with open(f'/proc/{pid_str}/status', 'r') as f:
+                    for line in f:
+                        if line.startswith('Uid:'):
+                            uid = int(line.split()[1])
+                            break
+            except Exception:
+                pass
+                
+            user = get_username(uid)
+            
+            # Resolve cgroups for Docker containers
+            try:
+                with open(f'/proc/{pid_str}/cgroup', 'r') as f:
+                    container_id = extract_container_id(f.read())
+                    if container_id:
+                        container_name = resolve_docker_container_name(container_id)
+            except Exception:
+                pass
+                
+            pid_cache[pid] = (proc_name, user, container_name)
+            
+        # Scan file descriptors for open sockets
+        fd_dir = f'/proc/{pid_str}/fd'
+        try:
+            fds = os.listdir(fd_dir)
+        except Exception:
+            continue
+            
+        for fd in fds:
+            try:
+                link = os.readlink(f'{fd_dir}/{fd}')
+                if link.startswith('socket:['):
+                    inode = int(link[8:-1])
+                    new_inode_to_proc[inode] = {
+                        'pid': pid,
+                        'name': proc_name,
+                        'user': user,
+                        'container': container_name
+                    }
+            except Exception:
+                continue
+                
+    inode_to_proc = new_inode_to_proc
+
+last_socket_scan_time = 0.0
+
+# Parse socket list from /proc/net/
+def scan_active_sockets():
+    global active_sockets, last_socket_scan_time
+    now = time.time()
+    # Rate limit to at most 10 times per second
+    if now - last_socket_scan_time < 0.1:
+        return
+    last_socket_scan_time = now
+    
+    new_active_sockets = {}
+    new_inodes = False
+    
+    files = [
+        ('/proc/net/tcp', False, 'tcp'),
+        ('/proc/net/tcp6', True, 'tcp'),
+        ('/proc/net/udp', False, 'udp'),
+        ('/proc/net/udp6', True, 'udp')
+    ]
+    
+    for path, is_ipv6, proto in files:
+        if not os.path.exists(path):
+            continue
+        try:
+            with open(path, 'r') as f:
+                next(f) # skip header
+                for line in f:
+                    parsed = parse_proc_net_line(line, is_ipv6)
+                    if parsed:
+                        key = (parsed['local_ip'], parsed['local_port'], 
+                               parsed['remote_ip'], parsed['remote_port'], proto)
+                        inode = parsed['inode']
+                        uid = parsed['uid']
+                        new_active_sockets[key] = (inode, uid)
+                        if inode not in inode_to_proc:
+                            new_inodes = True
+        except Exception as e:
+            logger.error(f"Error scanning {path}: {e}")
+            
+    active_sockets = new_active_sockets
+    if new_inodes:
+        proc_scan_event.set()
+
+# Active sockets match lookup
+def lookup_socket(src_ip, src_port, dst_ip, dst_port, proto, version):
+    wildcard_ip = '0.0.0.0' if version == 4 else '::'
+    
+    # Outbound checks
+    keys_out = [
+        (src_ip, src_port, dst_ip, dst_port, proto),
+        (src_ip, src_port, wildcard_ip, 0, proto),
+        (wildcard_ip, src_port, dst_ip, dst_port, proto),
+        (wildcard_ip, src_port, wildcard_ip, 0, proto)
+    ]
+    for k in keys_out:
+        if k in active_sockets:
+            inode, uid = active_sockets[k]
+            return inode, uid, 'out'
+            
+    # Inbound checks
+    keys_in = [
+        (dst_ip, dst_port, src_ip, src_port, proto),
+        (dst_ip, dst_port, wildcard_ip, 0, proto),
+        (wildcard_ip, dst_port, src_ip, src_port, proto),
+        (wildcard_ip, dst_port, wildcard_ip, 0, proto)
+    ]
+    for k in keys_in:
+        if k in active_sockets:
+            inode, uid = active_sockets[k]
+            return inode, uid, 'in'
+            
+    return None, None, None
+
+# Sniffer parser
+def parse_packet(data):
+    if len(data) < 20:
+        return None
+        
+    version = data[0] >> 4
+    if version == 4:
+        iph = struct.unpack('!BBHHHBBH4s4s', data[:20])
+        ihl = (iph[0] & 0x0F) * 4
+        if len(data) < ihl:
+            return None
+        proto = iph[6]
+        src_ip = socket.inet_ntoa(iph[8])
+        dst_ip = socket.inet_ntoa(iph[9])
+        payload = data[ihl:]
+    elif version == 6:
+        if len(data) < 40:
+            return None
+        iph = struct.unpack('!LHBB16s16s', data[:40])
+        proto = iph[2]
+        src_ip = socket.inet_ntop(socket.AF_INET6, iph[4])
+        dst_ip = socket.inet_ntop(socket.AF_INET6, iph[5])
+        payload = data[40:]
+    else:
+        return None
+        
+    src_port = None
+    dst_port = None
+    proto_name = None
+    
+    if proto == 6: # TCP
+        proto_name = 'tcp'
+        if len(payload) >= 4:
+            src_port, dst_port = struct.unpack('!HH', payload[:4])
+    elif proto == 17: # UDP
+        proto_name = 'udp'
+        if len(payload) >= 4:
+            src_port, dst_port = struct.unpack('!HH', payload[:4])
+            
+    if src_port is not None and dst_port is not None:
+        return {
+            'src_ip': src_ip,
+            'src_port': src_port,
+            'dst_ip': dst_ip,
+            'dst_port': dst_port,
+            'proto': proto_name,
+            'len': len(data),
+            'version': version
+        }
+    return None
+
+def process_packet(parsed):
+    inode, uid, direction = lookup_socket(
+        parsed['src_ip'], parsed['src_port'],
+        parsed['dst_ip'], parsed['dst_port'],
+        parsed['proto'], parsed['version']
+    )
+    
+    length = parsed['len']
+    
+    if inode is not None:
+        proc_info = inode_to_proc.get(inode)
+        if proc_info:
+            pid = proc_info['pid']
+            name = proc_info['name']
+            user = proc_info['user']
+            container = proc_info['container']
+        else:
+            pid = None
+            name = "Unknown"
+            user = get_username(uid)
+            container = None
+            proc_scan_event.set()
+    else:
+        pid = None
+        name = "Unknown"
+        user = "unknown"
+        container = None
+        socket_scan_event.set()
+        
+    key = (name, user, container)
+    with traffic_lock:
+        if key not in second_accumulator:
+            second_accumulator[key] = {'sent': 0, 'recv': 0, 'pid': pid}
+        if direction == 'out':
+            second_accumulator[key]['sent'] += length
+        else:
+            second_accumulator[key]['recv'] += length
+            
+        if key not in minute_accumulator:
+            minute_accumulator[key] = {'sent': 0, 'recv': 0}
+        if direction == 'out':
+            minute_accumulator[key]['sent'] += length
+        else:
+            minute_accumulator[key]['recv'] += length
+            
+        conn_key = (parsed['src_ip'], parsed['src_port'], parsed['dst_ip'], parsed['dst_port'], parsed['proto'], name)
+        if conn_key not in active_connections_accumulator:
+            active_connections_accumulator[conn_key] = {'sent': 0, 'recv': 0}
+        if direction == 'out':
+            active_connections_accumulator[conn_key]['sent'] += length
+        else:
+            active_connections_accumulator[conn_key]['recv'] += length
+
+# Alert logger
+def trigger_alert(process_name, message, severity):
+    now = time.time()
+    cache_key = (process_name, message)
+    if cache_key in alert_cache:
+        if now - alert_cache[cache_key] < 300: # rate-limit to once per 5 minutes
+            return
+    alert_cache[cache_key] = now
+    
+    try:
+        conn = sqlite3.connect(db_manager.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO alerts (timestamp, process_name, message, severity)
+            VALUES (?, ?, ?, ?)
+        ''', (int(now), process_name, message, severity))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to save alert in database: {e}")
+        
+    if main_loop:
+        asyncio.run_coroutine_threadsafe(
+            send_alert_async(int(now), process_name, message, severity),
+            main_loop
+        )
+
+async def send_alert_async(timestamp, process_name, message, severity):
+    payload = {
+        'type': 'alert',
+        'data': {
+            'timestamp': timestamp,
+            'process_name': process_name,
+            'message': message,
+            'severity': severity
+        }
+    }
+    msg_str = json.dumps(payload)
+    for ws in list(active_websockets):
+        try:
+            await ws.send_text(msg_str)
+        except Exception:
+            active_websockets.discard(ws)
+
+# Broadcast Metrics to WebSockets
+def broadcast_realtime_data(timestamp, total_sent, total_recv, top_processes):
+    if not active_websockets:
+        return
+    if main_loop:
+        asyncio.run_coroutine_threadsafe(
+            send_metrics_async(timestamp, total_sent, total_recv, top_processes),
+            main_loop
+        )
+
+async def send_metrics_async(timestamp, total_sent, total_recv, top_processes):
+    payload = {
+        'type': 'metrics',
+        'data': {
+            'timestamp': timestamp,
+            'total_sent_rate': total_sent,
+            'total_recv_rate': total_recv,
+            'session_total_bytes': session_total_bytes,
+            'top_processes': top_processes,
+            'connections': [
+                {
+                    'proto': v['proto'],
+                    'process': v['process'],
+                    'src': f"{v['src_ip']}:{v['src_port']}",
+                    'dst': f"{v['dst_ip']}:{v['dst_port']}",
+                    'sent_rate': v['sent_rate'],
+                    'recv_rate': v['recv_rate']
+                } for v in active_connections_history.values()
+            ]
+        }
+    }
+    msg_str = json.dumps(payload)
+    for ws in list(active_websockets):
+        try:
+            await ws.send_text(msg_str)
+        except Exception:
+            active_websockets.discard(ws)
+
+# Threads Run Loops
+def packet_sniff_loop():
+    logger.info("Packet sniffer loop thread starting...")
+    use_mock = False
+    try:
+        # AF_PACKET/SOCK_DGRAM cooked socket, binding to ETH_P_ALL
+        s = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(3))
+        s.settimeout(0.5)
+    except Exception as e:
+        logger.warning(f"Raw socket initialization failed: {e}. Falling back to MOCK Sniffer Mode for testing/non-root environment.")
+        use_mock = True
+
+    if use_mock:
+        import random
+        # Create some mock connections
+        mock_conns = [
+            ('127.0.0.1', 443, '192.168.1.15', 54321, 'tcp', 'nginx'),
+            ('8.8.8.8', 53, '192.168.1.15', 38291, 'udp', 'systemd-resolved'),
+            ('142.250.190.46', 443, '192.168.1.15', 49210, 'tcp', 'chrome'),
+            ('172.24.0.100', 8008, '192.168.1.15', 39122, 'tcp', 'python3')
+        ]
+        # Register mock connections in active_sockets & inode_to_proc to allow lookups
+        for idx, (rem_ip, rem_port, loc_ip, loc_port, proto, proc) in enumerate(mock_conns):
+            key = (loc_ip, loc_port, rem_ip, rem_port, proto)
+            inode = 999000 + idx
+            active_sockets[key] = (inode, 1000)
+            inode_to_proc[inode] = {
+                'pid': 9000 + idx,
+                'name': proc,
+                'user': 'server',
+                'container': 'docker-container' if idx == 3 else None
+            }
+            
+        while not stop_event.is_set():
+            time.sleep(0.1)
+            # Pick a random connection and send/receive random bytes
+            conn = random.choice(mock_conns)
+            rem_ip, rem_port, loc_ip, loc_port, proto, proc = conn
+            length = random.randint(64, 1500)
+            direction = random.choice(['in', 'out'])
+            
+            # Key accumulator info
+            key = (proc, 'server', 'docker-container' if proc == 'python3' else None)
+            
+            with traffic_lock:
+                if key not in second_accumulator:
+                    second_accumulator[key] = {'sent': 0, 'recv': 0, 'pid': 9000 + mock_conns.index(conn)}
+                if direction == 'out':
+                    second_accumulator[key]['sent'] += length
+                else:
+                    second_accumulator[key]['recv'] += length
+                    
+                if key not in minute_accumulator:
+                    minute_accumulator[key] = {'sent': 0, 'recv': 0}
+                if direction == 'out':
+                    minute_accumulator[key]['sent'] += length
+                else:
+                    minute_accumulator[key]['recv'] += length
+                    
+                src_ip = loc_ip if direction == 'out' else rem_ip
+                src_port = loc_port if direction == 'out' else rem_port
+                dst_ip = rem_ip if direction == 'out' else loc_ip
+                dst_port = rem_port if direction == 'out' else loc_port
+                
+                conn_key = (src_ip, src_port, dst_ip, dst_port, proto, proc)
+                if conn_key not in active_connections_accumulator:
+                    active_connections_accumulator[conn_key] = {'sent': 0, 'recv': 0}
+                if direction == 'out':
+                    active_connections_accumulator[conn_key]['sent'] += length
+                else:
+                    active_connections_accumulator[conn_key]['recv'] += length
+        logger.info("Mock packet sniffer loop thread stopped.")
+        return
+
+    while not stop_event.is_set():
+        try:
+            data, addr = s.recvfrom(65535)
+            parsed = parse_packet(data)
+            if parsed:
+                process_packet(parsed)
+        except socket.timeout:
+            continue
+        except Exception as e:
+            logger.error(f"Error reading packets: {e}")
+    s.close()
+    logger.info("Packet sniffer loop thread stopped.")
+
+def socket_scanner_loop():
+    logger.info("Socket connections scanner thread starting...")
+    while not stop_event.is_set():
+        try:
+            scan_active_sockets()
+        except Exception as e:
+            logger.error(f"Error scanning active socket namespaces: {e}")
+        # Wait for timeout (1s) or immediate socket scan trigger
+        socket_scan_event.wait(timeout=1.0)
+        socket_scan_event.clear()
+    logger.info("Socket connections scanner thread stopped.")
+
+def proc_scanner_loop():
+    logger.info("Proc process file descriptors scanner thread starting...")
+    last_scan = 0
+    # Run initial scan
+    scan_proc_fds()
+    
+    while not stop_event.is_set():
+        proc_scan_event.wait(timeout=0.5)
+        if stop_event.is_set():
+            break
+            
+        now = time.time()
+        # Rate limit proc directory traversal to at most once per 200ms (5Hz)
+        if now - last_scan >= 0.2:
+            try:
+                scan_proc_fds()
+                last_scan = now
+            except Exception as e:
+                logger.error(f"Error traversing /proc filesystem: {e}")
+            proc_scan_event.clear()
+    logger.info("Proc process file descriptors scanner thread stopped.")
+
+def aggregator_loop():
+    global second_accumulator, minute_accumulator, active_connections_accumulator, session_total_bytes
+    logger.info("Traffic aggregator loop thread starting...")
+    last_minute_flush = time.time()
+    
+    while not stop_event.is_set():
+        time.sleep(1.0)
+        now = time.time()
+        now_int = int(now)
+        
+        with traffic_lock:
+            sec_data = second_accumulator
+            second_accumulator = {}
+            conn_data = active_connections_accumulator
+            active_connections_accumulator = {}
+            
+        total_sent = 0
+        total_recv = 0
+        proc_list = []
+        for (name, user, container), stats in sec_data.items():
+            sent = stats['sent']
+            recv = stats['recv']
+            total_sent += sent
+            total_recv += recv
+            proc_list.append({
+                'name': name,
+                'user': user,
+                'container': container,
+                'pid': stats['pid'],
+                'sent': sent,
+                'recv': recv
+            })
+            
+            # Speed limits alerting logic
+            limit_bytes = SETTINGS['alert_threshold_mb_s'] * 1024 * 1024
+            if (sent + recv) > limit_bytes:
+                trigger_alert(name, f"Bandwidth limit exceeded: {format_speed(sent + recv)}", "WARNING")
+                
+            if name == "Unknown" and SETTINGS['check_unknown_process']:
+                unknown_limit = SETTINGS['alert_unknown_process_threshold_mb_s'] * 1024 * 1024
+                if (sent + recv) > unknown_limit:
+                    trigger_alert(name, f"Unknown application generating heavy traffic: {format_speed(sent + recv)}", "INFO")
+                    
+        session_total_bytes += total_sent + total_recv
+        proc_list.sort(key=lambda x: x['sent'] + x['recv'], reverse=True)
+        
+        realtime_history.append({
+            'timestamp': now_int,
+            'total_sent': total_sent,
+            'total_recv': total_recv,
+            'processes': proc_list[:20]
+        })
+        
+        # Connections rates
+        for conn_key, stats in conn_data.items():
+            src_ip, src_port, dst_ip, dst_port, proto, proc_name = conn_key
+            sent = stats['sent']
+            recv = stats['recv']
+            conn_id = f"{proto}://{src_ip}:{src_port}<->{dst_ip}:{dst_port}"
+            active_connections_history[conn_id] = {
+                'src_ip': src_ip,
+                'src_port': src_port,
+                'dst_ip': dst_ip,
+                'dst_port': dst_port,
+                'proto': proto,
+                'process': proc_name,
+                'sent_rate': sent,
+                'recv_rate': recv,
+                'last_seen': now_int
+            }
+            
+        for cid in list(active_connections_history.keys()):
+            if now_int - active_connections_history[cid]['last_seen'] > 10:
+                active_connections_history.pop(cid, None)
+                
+        broadcast_realtime_data(now_int, total_sent, total_recv, proc_list[:10])
+        
+        # Flush aggregates database every 60 seconds
+        if now - last_minute_flush >= 60.0:
+            last_minute_flush = now
+            with traffic_lock:
+                min_data = minute_accumulator
+                minute_accumulator = {}
+                
+            if min_data:
+                batch = []
+                for (name, user, container), stats in min_data.items():
+                    batch.append((now_int, name, user, container, stats['sent'], stats['recv']))
+                try:
+                    db_manager.write_raw_batch(batch)
+                except Exception as e:
+                    logger.error(f"Error logging batch database metrics: {e}")
+    logger.info("Traffic aggregator loop thread stopped.")
+
+def rollup_loop():
+    logger.info("Database rollup agent thread starting...")
+    last_rollup = time.time()
+    while not stop_event.is_set():
+        time.sleep(10.0)
+        now = time.time()
+        if now - last_rollup >= 3600:
+            try:
+                db_manager.rollup_and_prune()
+                last_rollup = now
+            except Exception as e:
+                logger.error(f"Rollup agent error: {e}")
+    logger.info("Database rollup agent thread stopped.")
+
+# FastAPI Web Endpoint Declarations
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global main_loop
+    main_loop = asyncio.get_running_loop()
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+@app.get("/", response_class=HTMLResponse)
+def read_index():
+    return HTML_CONTENT
+
+@app.get("/api/status")
+def get_status():
+    import resource
+    uptime = int(time.time()) - start_time
+    mem_usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024 # maxrss in KB
+    try:
+        db_size = os.path.getsize(DB_PATH)
+    except Exception:
+        db_size = 0
+        
+    return {
+        'uptime': uptime,
+        'memory_bytes': mem_usage,
+        'database_size_bytes': db_size,
+        'active_sockets_count': len(active_sockets),
+        'cached_processes': len(pid_cache),
+        'session_total_bytes': session_total_bytes,
+        'status': 'OK'
+    }
+
+@app.get("/api/history")
+def get_history(range: str = '24h'):
+    if range not in ['24h', '7d', '30d', 'all']:
+        range = '24h'
+    return db_manager.get_history(range)
+
+@app.get("/api/top")
+def get_top_consumers(range: str = '24h', limit: int = 20):
+    if range not in ['24h', '7d', '30d', 'all']:
+        range = '24h'
+    return db_manager.get_top_consumers(range, limit)
+
+@app.get("/api/alerts")
+def get_alerts(limit: int = 50):
+    return db_manager.get_alerts(limit)
+
+@app.get("/api/settings")
+def get_settings():
+    return SETTINGS
+
+@app.post("/api/settings")
+def save_settings(settings: dict):
+    global SETTINGS
+    if 'alert_threshold_mb_s' in settings:
+        SETTINGS['alert_threshold_mb_s'] = float(settings['alert_threshold_mb_s'])
+    if 'check_unknown_process' in settings:
+        SETTINGS['check_unknown_process'] = bool(settings['check_unknown_process'])
+    if 'alert_unknown_process_threshold_mb_s' in settings:
+        SETTINGS['alert_unknown_process_threshold_mb_s'] = float(settings['alert_unknown_process_threshold_mb_s'])
+    return {'status': 'success', 'settings': SETTINGS}
+
+@app.get("/api/export")
+def export_data(range: str = '24h', format: str = 'csv'):
+    if range not in ['24h', '7d', '30d', 'all']:
+        range = '24h'
+        
+    data = db_manager.get_history(range)
+    if format == 'json':
+        return data
+        
+    # Standard CSV writer streaming response
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(['timestamp', 'name', 'user', 'container', 'bytes_sent', 'bytes_recv'])
+    for row in data:
+        writer.writerow([
+            row['timestamp'],
+            row['name'],
+            row['user'],
+            row['container'] or '',
+            row['bytes_sent'],
+            row['bytes_recv']
+        ])
+    output.seek(0)
+    return StreamingResponse(
+        io.StringIO(output.getvalue()), 
+        media_type="text/csv", 
+        headers={"Content-Disposition": f"attachment; filename=netmon_export_{range}.csv"}
+    )
+
+@app.websocket("/ws")
+async def websocket_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    active_websockets.add(websocket)
+    
+    # Send initial history
+    try:
+        # Format the last 60 points of realtime total speed to let the chart fill up immediately
+        initial_points = []
+        for pt in list(realtime_history):
+            initial_points.append({
+                'timestamp': pt['timestamp'],
+                'total_sent_rate': pt['total_sent'],
+                'total_recv_rate': pt['total_recv']
+            })
+        await websocket.send_json({
+            'type': 'history',
+            'data': initial_points
+        })
+        
+        while True:
+            # Keep connection open, client is passive listener
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        active_websockets.discard(websocket)
+    except Exception:
+        active_websockets.discard(websocket)
+
+# HTML Dashboard Asset String
+HTML_CONTENT = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NetMon | Application Network Monitor</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-primary: #090d16;
+            --bg-secondary: #111827;
+            --bg-card: rgba(30, 41, 59, 0.45);
+            --border-color: rgba(255, 255, 255, 0.08);
+            --border-hover: rgba(99, 102, 241, 0.3);
+            --text-main: #f3f4f6;
+            --text-muted: #9ca3af;
+            --color-download: #06b6d4;
+            --color-upload: #f97316;
+            --color-accent: #6366f1;
+            --color-accent-hover: #4f46e5;
+            --color-warning: #ef4444;
+            --color-success: #10b981;
+        }
+
+        * {
+            box-sizing: border-box;
+            outline: none;
+        }
+
+        body {
+            background-color: var(--bg-primary);
+            color: var(--text-main);
+            font-family: 'Outfit', sans-serif;
+            margin: 0;
+            padding: 0;
+            display: flex;
+            min-height: 100vh;
+            overflow-x: hidden;
+        }
+
+        /* Layout Structure */
+        #sidebar {
+            width: 260px;
+            background-color: var(--bg-secondary);
+            border-right: 1px solid var(--border-color);
+            padding: 30px 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 40px;
+            position: fixed;
+            height: 100vh;
+        }
+
+        #main-content {
+            margin-left: 260px;
+            flex-grow: 1;
+            padding: 40px;
+            max-width: 1400px;
+            display: flex;
+            flex-direction: column;
+            gap: 30px;
+        }
+
+        /* Sidebar UI */
+        .logo-container {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .logo-icon {
+            width: 38px;
+            height: 38px;
+            background: linear-gradient(135deg, var(--color-accent), var(--color-download));
+            border-radius: 10px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: 700;
+            font-size: 20px;
+            color: white;
+            box-shadow: 0 4px 14px rgba(99, 102, 241, 0.4);
+        }
+
+        .logo-text {
+            font-weight: 700;
+            font-size: 22px;
+            letter-spacing: 0.5px;
+            background: linear-gradient(to right, #ffffff, #94a3b8);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .nav-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .nav-item {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            padding: 14px 18px;
+            border-radius: 10px;
+            cursor: pointer;
+            color: var(--text-muted);
+            font-weight: 500;
+            transition: all 0.2s ease;
+        }
+
+        .nav-item:hover {
+            background-color: rgba(255, 255, 255, 0.03);
+            color: var(--text-main);
+        }
+
+        .nav-item.active {
+            background-color: rgba(99, 102, 241, 0.15);
+            color: #a5b4fc;
+            border: 1px solid rgba(99, 102, 241, 0.2);
+        }
+
+        .system-status {
+            margin-top: auto;
+            background-color: rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 15px;
+            font-size: 13px;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            color: var(--text-muted);
+        }
+
+        .status-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--color-success);
+            margin-right: 6px;
+            box-shadow: 0 0 8px var(--color-success);
+        }
+
+        /* Main Elements */
+        .page-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .page-title {
+            margin: 0;
+            font-size: 28px;
+            font-weight: 700;
+        }
+
+        .page-subtitle {
+            margin: 5px 0 0 0;
+            color: var(--text-muted);
+            font-size: 14px;
+        }
+
+        /* Stats Cards */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+            gap: 20px;
+        }
+
+        .card {
+            background: var(--bg-card);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            transition: border-color 0.3s ease;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
+        }
+
+        .card:hover {
+            border-color: var(--border-hover);
+        }
+
+        .card-label {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .card-value {
+            font-size: 36px;
+            font-weight: 700;
+            font-family: 'JetBrains Mono', monospace;
+            background: linear-gradient(135deg, #ffffff, #cbd5e1);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+        }
+
+        .card-subtext {
+            font-size: 13px;
+            color: var(--text-muted);
+        }
+
+        /* Dashboard Section Content Grid */
+        .content-grid {
+            display: grid;
+            grid-template-columns: 2fr 1fr;
+            gap: 24px;
+        }
+
+        @media (max-width: 1024px) {
+            .content-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .canvas-container {
+            width: 100%;
+            height: 250px;
+            position: relative;
+        }
+
+        #speedChart {
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        /* Data Tables */
+        .table-card {
+            grid-column: span 2;
+        }
+        
+        @media (max-width: 1024px) {
+            .table-card {
+                grid-column: span 1;
+            }
+        }
+
+        .table-header-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .table-title {
+            font-size: 18px;
+            font-weight: 700;
+            margin: 0;
+        }
+
+        .search-container {
+            display: flex;
+            gap: 12px;
+            align-items: center;
+        }
+
+        .search-input {
+            background-color: rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 8px 14px;
+            color: white;
+            font-size: 14px;
+            width: 220px;
+            transition: all 0.2s ease;
+        }
+
+        .search-input:focus {
+            border-color: var(--color-accent);
+            box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+            table-layout: fixed;
+        }
+
+        th {
+            padding: 12px 16px;
+            color: var(--text-muted);
+            font-weight: 600;
+            font-size: 13px;
+            text-transform: uppercase;
+            border-bottom: 1px solid var(--border-color);
+            letter-spacing: 0.5px;
+            text-overflow: ellipsis;
+            overflow: hidden;
+            white-space: nowrap;
+        }
+
+        td {
+            padding: 14px 16px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.03);
+            font-size: 14px;
+            vertical-align: middle;
+            text-overflow: ellipsis;
+            overflow: hidden;
+            white-space: nowrap;
+        }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        .font-mono {
+            font-family: 'JetBrains Mono', monospace;
+            font-variant-numeric: tabular-nums;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+
+        .badge-download {
+            background-color: rgba(6, 182, 212, 0.12);
+            color: #22d3ee;
+            border: 1px solid rgba(6, 182, 212, 0.2);
+        }
+
+        .badge-upload {
+            background-color: rgba(249, 115, 22, 0.12);
+            color: #fb923c;
+            border: 1px solid rgba(249, 115, 22, 0.2);
+        }
+
+        .badge-container {
+            background-color: rgba(99, 102, 241, 0.12);
+            color: #c7d2fe;
+            border: 1px solid rgba(99, 102, 241, 0.2);
+        }
+
+        /* Distribution Bars */
+        .bar-container {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-bottom: 16px;
+        }
+
+        .bar-info {
+            display: flex;
+            justify-content: space-between;
+            font-size: 13px;
+        }
+
+        .bar-label {
+            font-weight: 600;
+        }
+
+        .bar-val {
+            font-family: 'JetBrains Mono', monospace;
+            color: var(--text-muted);
+        }
+
+        .bar-track {
+            height: 8px;
+            background-color: rgba(255, 255, 255, 0.05);
+            border-radius: 4px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .bar-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+
+        .bar-fill-download {
+            background: linear-gradient(to right, var(--color-accent), var(--color-download));
+        }
+
+        /* Tab Views Control */
+        .tab-view {
+            display: none;
+            flex-direction: column;
+            gap: 30px;
+        }
+
+        .tab-view.active {
+            display: flex;
+        }
+
+        /* Settings Forms */
+        .form-group {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            margin-bottom: 20px;
+        }
+
+        .form-label {
+            font-size: 14px;
+            font-weight: 600;
+            color: var(--text-muted);
+        }
+
+        .form-control {
+            background-color: rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 10px 14px;
+            color: white;
+            font-size: 15px;
+            width: 100%;
+            max-width: 400px;
+        }
+
+        .form-control:focus {
+            border-color: var(--color-accent);
+        }
+
+        .form-checkbox-container {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 20px;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .form-checkbox {
+            width: 18px;
+            height: 18px;
+            accent-color: var(--color-accent);
+        }
+
+        .btn {
+            background-color: var(--color-accent);
+            color: white;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 20px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background-color 0.2s;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+
+        .btn:hover {
+            background-color: var(--color-accent-hover);
+        }
+
+        .btn-secondary {
+            background-color: rgba(255, 255, 255, 0.05);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+        }
+
+        .btn-secondary:hover {
+            background-color: rgba(255, 255, 255, 0.08);
+        }
+
+        /* Alerts List CSS */
+        .alert-item {
+            background-color: rgba(239, 68, 68, 0.05);
+            border: 1px solid rgba(239, 68, 68, 0.15);
+            border-radius: 10px;
+            padding: 15px 20px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 15px;
+        }
+
+        .alert-item.severity-info {
+            background-color: rgba(99, 102, 241, 0.05);
+            border: 1px solid rgba(99, 102, 241, 0.15);
+        }
+
+        .alert-item-title {
+            font-weight: 600;
+            font-size: 15px;
+            margin-bottom: 4px;
+        }
+
+        .alert-item-time {
+            font-size: 12px;
+            color: var(--text-muted);
+            font-family: 'JetBrains Mono', monospace;
+        }
+
+        /* History Query UI */
+        .history-controls {
+            display: flex;
+            gap: 16px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .select-control {
+            background-color: rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--border-color);
+            border-radius: 8px;
+            padding: 8px 14px;
+            color: white;
+            font-size: 14px;
+            cursor: pointer;
+        }
+        
+        .empty-state {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-muted);
+            font-size: 15px;
+        }
+
+        /* Print friendly view styles */
+        @media print {
+            body {
+                background: white;
+                color: black;
+            }
+            #sidebar {
+                display: none;
+            }
+            #main-content {
+                margin-left: 0;
+                padding: 0;
+            }
+            .card, .table-card {
+                box-shadow: none;
+                border: 1px solid #ccc;
+                background: white;
+            }
+            .btn, .search-container, .history-controls {
+                display: none;
+            }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- SIDEBAR -->
+    <div id="sidebar">
+        <div class="logo-container">
+            <div class="logo-icon">⇅</div>
+            <div class="logo-text">NetMon</div>
+        </div>
+        
+        <ul class="nav-list">
+            <li class="nav-item active" data-target="view-dashboard">
+                <span>⚡</span> Dashboard
+            </li>
+            <li class="nav-item" data-target="view-history">
+                <span>📊</span> History
+            </li>
+            <li class="nav-item" data-target="view-alerts">
+                <span>⚠️</span> Alerts
+            </li>
+            <li class="nav-item" data-target="view-settings">
+                <span>⚙️</span> Settings
+            </li>
+        </ul>
+
+        <div class="system-status">
+            <div><span class="status-dot" id="ws-status-dot"></span><span id="ws-status-text">Disconnected</span></div>
+            <div style="margin-top: 5px;">Uptime: <span id="sys-uptime" class="font-mono">0s</span></div>
+            <div>Database: <span id="sys-dbsize" class="font-mono">0 KB</span></div>
+            <div>Sockets: <span id="sys-sockets" class="font-mono">0</span></div>
+        </div>
+    </div>
+
+    <!-- MAIN CONTENT -->
+    <div id="main-content">
+        
+        <!-- DASHBOARD VIEW -->
+        <div id="view-dashboard" class="tab-view active">
+            <div class="page-header">
+                <div>
+                    <h1 class="page-title">Real-Time Bandwidth</h1>
+                    <p class="page-subtitle">Per-application network socket analyzer</p>
+                </div>
+            </div>
+
+            <!-- Stats Grid -->
+            <div class="stats-grid">
+                <div class="card" style="border-left: 4px solid var(--color-download);">
+                    <div class="card-label">
+                        <span style="color: var(--color-download);">↓</span> Download Rate
+                    </div>
+                    <div class="card-value" id="stat-download-rate">0.00 B/s</div>
+                    <div class="card-subtext">Incoming network packets</div>
+                </div>
+                <div class="card" style="border-left: 4px solid var(--color-upload);">
+                    <div class="card-label">
+                        <span style="color: var(--color-upload);">↑</span> Upload Rate
+                    </div>
+                    <div class="card-value" id="stat-upload-rate">0.00 B/s</div>
+                    <div class="card-subtext">Outgoing network packets</div>
+                </div>
+                <div class="card" style="border-left: 4px solid var(--color-accent);">
+                    <div class="card-label">
+                        <span>⇅</span> Total Traffic (Session)
+                    </div>
+                    <div class="card-value" id="stat-total-session">0.00 B</div>
+                    <div class="card-subtext">Total data parsed since daemon start</div>
+                </div>
+            </div>
+
+            <!-- Chart & App distribution -->
+            <div class="content-grid">
+                <div class="card">
+                    <div class="card-label">Network Load History (Last 60s)</div>
+                    <div class="canvas-container">
+                        <canvas id="speedChart"></canvas>
+                    </div>
+                </div>
+                <div class="card" id="top-apps-dist-card">
+                    <div class="card-label">Top Applications Distribution</div>
+                    <div style="flex-grow: 1; display: flex; flex-direction: column; justify-content: center;" id="dist-bars-container">
+                        <div class="empty-state">No real-time traffic detected yet.</div>
+                    </div>
+                </div>
+                
+                <!-- Applications Table -->
+                <div class="card table-card">
+                    <div class="table-header-row">
+                        <h2 class="table-title">Active Applications Network Consumption</h2>
+                        <div class="search-container">
+                            <input type="text" id="app-search" class="search-input" placeholder="Search by name, user...">
+                        </div>
+                    </div>
+                    <div style="overflow-x: auto;">
+                        <table id="apps-table">
+                            <colgroup>
+                                <col style="width: 25%;">
+                                <col style="width: 10%;">
+                                <col style="width: 15%;">
+                                <col style="width: 18%;">
+                                <col style="width: 16%;">
+                                <col style="width: 16%;">
+                            </colgroup>
+                            <thead>
+                                <tr>
+                                    <th>Application</th>
+                                    <th>PID</th>
+                                    <th>User</th>
+                                    <th>Container</th>
+                                    <th>↓ Download Speed</th>
+                                    <th>↑ Upload Speed</th>
+                                </tr>
+                            </thead>
+                            <tbody id="apps-table-body">
+                                <tr>
+                                    <td colspan="6" class="empty-state">Waiting for data...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+
+                <!-- Connections Table -->
+                <div class="card table-card">
+                    <div class="table-header-row">
+                        <h2 class="table-title">Active Sockets Trace</h2>
+                        <div class="search-container">
+                            <input type="text" id="conn-search" class="search-input" placeholder="Search by socket...">
+                        </div>
+                    </div>
+                    <div style="overflow-x: auto; max-height: 400px;">
+                        <table id="conns-table">
+                            <colgroup>
+                                <col style="width: 10%;">
+                                <col style="width: 18%;">
+                                <col style="width: 28%;">
+                                <col style="width: 28%;">
+                                <col style="width: 8%;">
+                                <col style="width: 8%;">
+                            </colgroup>
+                            <thead>
+                                <tr>
+                                    <th>Protocol</th>
+                                    <th>Application</th>
+                                    <th>Local Endpoint</th>
+                                    <th>Remote Endpoint</th>
+                                    <th>Download</th>
+                                    <th>Upload</th>
+                                </tr>
+                            </thead>
+                            <tbody id="conns-table-body">
+                                <tr>
+                                    <td colspan="6" class="empty-state">No active sockets transmitting data...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- HISTORY VIEW -->
+        <div id="view-history" class="tab-view">
+            <div class="page-header">
+                <div>
+                    <h1 class="page-title">Historical Records</h1>
+                    <p class="page-subtitle">Aggregated system database analysis</p>
+                </div>
+                <div class="history-controls">
+                    <select id="history-range-select" class="select-control">
+                        <option value="24h">Last 24 Hours</option>
+                        <option value="7d">Last 7 Days</option>
+                        <option value="30d">Last 30 Days</option>
+                        <option value="all">All Time</option>
+                    </select>
+                    <button class="btn btn-secondary" id="btn-export-json">Export JSON</button>
+                    <button class="btn btn-secondary" id="btn-export-csv">Export CSV</button>
+                    <button class="btn" id="btn-print-report">Print Report</button>
+                </div>
+            </div>
+
+            <!-- Top Consumers -->
+            <div class="card">
+                <div class="card-label" id="history-consumers-title">Top Bandwidth Consumers (Last 24 Hours)</div>
+                <div style="overflow-x: auto; margin-top: 15px;">
+                    <table id="history-table">
+                        <colgroup>
+                            <col style="width: 25%;">
+                            <col style="width: 15%;">
+                            <col style="width: 18%;">
+                            <col style="width: 14%;">
+                            <col style="width: 14%;">
+                            <col style="width: 14%;">
+                        </colgroup>
+                        <thead>
+                            <tr>
+                                <th>Application</th>
+                                <th>User</th>
+                                <th>Container</th>
+                                <th>Bytes Downloaded</th>
+                                <th>Bytes Uploaded</th>
+                                <th>Total Consumed</th>
+                            </tr>
+                        </thead>
+                        <tbody id="history-table-body">
+                            <tr>
+                                <td colspan="6" class="empty-state">Select a range to retrieve records.</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <!-- ALERTS VIEW -->
+        <div id="view-alerts" class="tab-view">
+            <div class="page-header">
+                <div>
+                    <h1 class="page-title">Security & Traffic Alerts</h1>
+                    <p class="page-subtitle">Historical log of bandwidth anomalies</p>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-label">Anomalies & Exceeded Threshold Logs</div>
+                <div style="display: flex; flex-direction: column; gap: 12px; margin-top: 15px;" id="alerts-container">
+                    <div class="empty-state">No alerts recorded in the database.</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- SETTINGS VIEW -->
+        <div id="view-settings" class="tab-view">
+            <div class="page-header">
+                <div>
+                    <h1 class="page-title">Configuration Settings</h1>
+                    <p class="page-subtitle">Configure thresholds and checks</p>
+                </div>
+            </div>
+
+            <div class="card" style="max-width: 600px;">
+                <div class="card-label">Threshold Configurations</div>
+                <div style="margin-top: 20px;">
+                    <div class="form-group">
+                        <label class="form-label" for="setting-threshold">Process Bandwidth Threshold (MB/s)</label>
+                        <input type="number" id="setting-threshold" class="form-control" min="0.1" step="0.1">
+                    </div>
+                    
+                    <div class="form-checkbox-container" id="check-unknown-container">
+                        <input type="checkbox" id="setting-check-unknown" class="form-checkbox">
+                        <label class="form-label" style="cursor: pointer;" for="setting-check-unknown">Inspect and alert on unknown processes</label>
+                    </div>
+
+                    <div class="form-group" id="group-unknown-threshold">
+                        <label class="form-label" for="setting-unknown-threshold">Unknown Process Bandwidth Threshold (MB/s)</label>
+                        <input type="number" id="setting-unknown-threshold" class="form-control" min="0.1" step="0.1">
+                    </div>
+
+                    <button class="btn" id="btn-save-settings" style="margin-top: 10px;">Save Settings</button>
+                </div>
+            </div>
+        </div>
+
+    </div>
+
+    <script>
+        // Data formatters
+        function formatBytes(bytes) {
+            if (bytes === 0) return '0 B';
+            const k = 1024;
+            const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
+            const i = Math.floor(Math.log(bytes) / Math.log(k));
+            return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+        }
+
+        // DOM Elements builders (strictly avoiding innerHTML for XSS)
+        function el(tag, attrs = {}, children = []) {
+            const element = document.createElement(tag);
+            for (const [key, val] of Object.entries(attrs)) {
+                if (key.startsWith('on') && typeof val === 'function') {
+                    element.addEventListener(key.substring(2).toLowerCase(), val);
+                } else {
+                    element.setAttribute(key, val);
+                }
+            }
+            if (typeof children === 'string') {
+                element.textContent = children;
+            } else if (Array.isArray(children)) {
+                children.forEach(child => {
+                    if (typeof child === 'string') {
+                        element.appendChild(document.createTextNode(child));
+                    } else if (child instanceof HTMLElement) {
+                        element.appendChild(child);
+                    }
+                });
+            } else if (children instanceof HTMLElement) {
+                element.appendChild(children);
+            }
+            return element;
+        }
+
+        // Custom Canvas Chart Engine
+        class RealtimeChart {
+            constructor(canvas) {
+                this.canvas = canvas;
+                this.ctx = canvas.getContext('2d');
+                this.history = [];
+                this.maxPoints = 60;
+                window.addEventListener('resize', () => this.resize());
+                this.resize();
+            }
+
+            resize() {
+                const rect = this.canvas.getBoundingClientRect();
+                const dpr = window.devicePixelRatio || 1;
+                this.canvas.width = rect.width * dpr;
+                this.canvas.height = rect.height * dpr;
+                this.ctx.scale(dpr, dpr);
+                this.width = rect.width;
+                this.height = rect.height;
+                this.draw();
+            }
+
+            addData(download, upload) {
+                this.history.push({ download, upload });
+                if (this.history.length > this.maxPoints) {
+                    this.history.shift();
+                }
+                this.draw();
+            }
+
+            fillHistory(historyData) {
+                this.history = historyData.map(pt => ({
+                    download: pt.total_recv_rate,
+                    upload: pt.total_sent_rate
+                }));
+                this.draw();
+            }
+
+            draw() {
+                const ctx = this.ctx;
+                ctx.clearRect(0, 0, this.width, this.height);
+                if (this.history.length < 2) return;
+
+                let maxVal = 1024 * 1024; // Min scale 1 MB/s
+                this.history.forEach(d => {
+                    if (d.download > maxVal) maxVal = d.download;
+                    if (d.upload > maxVal) maxVal = d.upload;
+                });
+
+                // Draw background grid lines
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                for (let i = 1; i < 4; i++) {
+                    const y = (this.height / 4) * i;
+                    ctx.moveTo(0, y);
+                    ctx.lineTo(this.width, y);
+                }
+                ctx.stroke();
+
+                // Axis text labels
+                ctx.fillStyle = '#64748b';
+                ctx.font = '10px "Outfit", sans-serif';
+                for (let i = 0; i < 4; i++) {
+                    const val = maxVal * (1 - i / 4);
+                    ctx.fillText(formatBytes(val) + '/s', 10, (this.height / 4) * i + 14);
+                }
+
+                const getX = (index) => (index / (this.maxPoints - 1)) * this.width;
+                const getY = (val) => this.height - (val / maxVal) * (this.height - 24) - 12;
+
+                // Plot lines
+                this.drawLinePath(ctx, getX, getY, d => d.download, '#06b6d4', 'rgba(6, 182, 212, 0.04)');
+                this.drawLinePath(ctx, getX, getY, d => d.upload, '#f97316', 'rgba(249, 115, 22, 0.04)');
+            }
+
+            drawLinePath(ctx, getX, getY, valExtractor, color, fillColor) {
+                ctx.beginPath();
+                ctx.moveTo(getX(0), getY(valExtractor(this.history[0])));
+                for (let i = 1; i < this.history.length; i++) {
+                    ctx.lineTo(getX(i), getY(valExtractor(this.history[i])));
+                }
+                ctx.strokeStyle = color;
+                ctx.lineWidth = 2;
+                ctx.stroke();
+
+                ctx.lineTo(getX(this.history.length - 1), this.height);
+                ctx.lineTo(getX(0), this.height);
+                ctx.closePath();
+                ctx.fillStyle = fillColor;
+                ctx.fill();
+            }
+        }
+
+        // Global objects
+        let chartInstance;
+        let wsConn;
+        let sessionTotalTraffic = 0;
+        let currentSearchAppQuery = "";
+        let currentSearchConnQuery = "";
+
+        // Tab Views Navigation
+        document.querySelectorAll('.nav-item').forEach(item => {
+            item.addEventListener('click', function() {
+                document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+                document.querySelectorAll('.tab-view').forEach(v => v.classList.remove('active'));
+                
+                this.classList.add('active');
+                const target = this.getAttribute('data-target');
+                document.getElementById(target).classList.add('active');
+                
+                if (target === 'view-history') {
+                    queryHistory();
+                } else if (target === 'view-alerts') {
+                    queryAlerts();
+                } else if (target === 'view-settings') {
+                    querySettings();
+                }
+            });
+        });
+
+        // Initialize Realtime Chart
+        window.addEventListener('DOMContentLoaded', () => {
+            const canvas = document.getElementById('speedChart');
+            chartInstance = new RealtimeChart(canvas);
+            
+            // Periodically check FastAPI server status
+            updateSystemStatus();
+            setInterval(updateSystemStatus, 5000);
+            
+            // Connect socket
+            connectWebSocket();
+
+            // Search event listeners
+            document.getElementById('app-search').addEventListener('input', (e) => {
+                currentSearchAppQuery = e.target.value.toLowerCase();
+            });
+            document.getElementById('conn-search').addEventListener('input', (e) => {
+                currentSearchConnQuery = e.target.value.toLowerCase();
+            });
+
+            // History elements listeners
+            document.getElementById('history-range-select').addEventListener('change', queryHistory);
+            document.getElementById('btn-export-json').addEventListener('click', () => triggerExport('json'));
+            document.getElementById('btn-export-csv').addEventListener('click', () => triggerExport('csv'));
+            document.getElementById('btn-print-report').addEventListener('click', () => window.print());
+
+            // Settings buttons
+            document.getElementById('btn-save-settings').addEventListener('click', saveSettings);
+            document.getElementById('setting-check-unknown').addEventListener('change', function() {
+                document.getElementById('group-unknown-threshold').style.display = this.checked ? 'flex' : 'none';
+            });
+        });
+
+        function connectWebSocket() {
+            const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const host = window.location.host;
+            wsConn = new WebSocket(`${proto}//${host}/ws`);
+            
+            const dot = document.getElementById('ws-status-dot');
+            const text = document.getElementById('ws-status-text');
+
+            wsConn.onopen = () => {
+                dot.style.backgroundColor = 'var(--color-success)';
+                dot.style.boxShadow = '0 0 8px var(--color-success)';
+                text.textContent = 'Connected';
+            };
+
+            wsConn.onclose = () => {
+                dot.style.backgroundColor = 'var(--color-warning)';
+                dot.style.boxShadow = '0 0 8px var(--color-warning)';
+                text.textContent = 'Disconnected';
+                setTimeout(connectWebSocket, 3000); // retry
+            };
+
+            wsConn.onmessage = (event) => {
+                const message = JSON.parse(event.data);
+                if (message.type === 'history') {
+                    chartInstance.fillHistory(message.data);
+                } else if (message.type === 'metrics') {
+                    renderRealtimeMetrics(message.data);
+                } else if (message.type === 'alert') {
+                    displayRealtimeAlertNotification(message.data);
+                }
+            };
+        }
+
+        // Live calculations & renderer
+        function renderRealtimeMetrics(data) {
+            // Stat values
+            document.getElementById('stat-download-rate').textContent = formatBytes(data.total_recv_rate) + '/s';
+            document.getElementById('stat-upload-rate').textContent = formatBytes(data.total_sent_rate) + '/s';
+            
+            sessionTotalTraffic = data.session_total_bytes;
+            document.getElementById('stat-total-session').textContent = formatBytes(sessionTotalTraffic);
+
+            // Add point to chart
+            chartInstance.addData(data.total_recv_rate, data.total_sent_rate);
+
+            // 1. Render Distribution bar-charts
+            const distContainer = document.getElementById('dist-bars-container');
+            distContainer.replaceChildren();
+            
+            const activeTop = data.top_processes.slice(0, 5);
+            if (activeTop.length === 0) {
+                distContainer.appendChild(el('div', { class: 'empty-state' }, 'No active traffic detected.'));
+            } else {
+                const maxRate = Math.max(...activeTop.map(p => p.sent + p.recv));
+                activeTop.forEach(p => {
+                    const total = p.sent + p.recv;
+                    const pct = maxRate > 0 ? (total / maxRate) * 100 : 0;
+                    
+                    const labelSpan = el('span', { class: 'bar-label' }, p.name);
+                    const valSpan = el('span', { class: 'bar-val' }, formatBytes(total) + '/s');
+                    const infoDiv = el('div', { class: 'bar-info' }, [labelSpan, valSpan]);
+                    
+                    const fillDiv = el('div', { class: 'bar-fill bar-fill-download', style: `width: ${pct}%` });
+                    const trackDiv = el('div', { class: 'bar-track' }, [fillDiv]);
+                    
+                    const container = el('div', { class: 'bar-container' }, [infoDiv, trackDiv]);
+                    distContainer.appendChild(container);
+                });
+            }
+
+            // 2. Render Apps Table
+            const appsBody = document.getElementById('apps-table-body');
+            appsBody.replaceChildren();
+            
+            const filteredApps = data.top_processes.filter(p => {
+                if (currentSearchAppQuery === "") return true;
+                return p.name.toLowerCase().includes(currentSearchAppQuery) || 
+                       p.user.toLowerCase().includes(currentSearchAppQuery);
+            });
+
+            if (filteredApps.length === 0) {
+                appsBody.appendChild(el('tr', {}, [
+                    el('td', { colspan: '6', class: 'empty-state' }, 'No applications matching filter...')
+                ]));
+            } else {
+                filteredApps.forEach(p => {
+                    const row = el('tr', {}, [
+                        el('td', { class: 'font-mono', style: 'font-weight:600;', title: p.name }, p.name),
+                        el('td', {}, p.pid !== null ? String(p.pid) : '-'),
+                        el('td', {}, p.user),
+                        el('td', {}, p.container ? el('span', { class: 'badge badge-container', title: p.container }, p.container) : '-'),
+                        el('td', { class: 'font-mono', style: 'color: var(--color-download)' }, formatBytes(p.recv) + '/s'),
+                        el('td', { class: 'font-mono', style: 'color: var(--color-upload)' }, formatBytes(p.sent) + '/s')
+                    ]);
+                    appsBody.appendChild(row);
+                });
+            }
+
+            // 3. Render Sockets/Connections Table
+            const connsBody = document.getElementById('conns-table-body');
+            connsBody.replaceChildren();
+            
+            const filteredConns = data.connections.filter(c => {
+                if (currentSearchConnQuery === "") return true;
+                return c.process.toLowerCase().includes(currentSearchConnQuery) ||
+                       c.src.includes(currentSearchConnQuery) ||
+                       c.dst.includes(currentSearchConnQuery);
+            });
+
+            if (filteredConns.length === 0) {
+                connsBody.appendChild(el('tr', {}, [
+                    el('td', { colspan: '6', class: 'empty-state' }, 'No active connections matching filter...')
+                ]));
+            } else {
+                filteredConns.forEach(c => {
+                    const row = el('tr', {}, [
+                        el('td', {}, [el('span', { class: c.proto === 'tcp' ? 'badge badge-download' : 'badge badge-upload' }, c.proto)]),
+                        el('td', { class: 'font-mono', title: c.process }, c.process),
+                        el('td', { class: 'font-mono', title: c.src }, c.src),
+                        el('td', { class: 'font-mono', title: c.dst }, c.dst),
+                        el('td', { class: 'font-mono', style: 'color: var(--color-download)' }, formatBytes(c.recv_rate) + '/s'),
+                        el('td', { class: 'font-mono', style: 'color: var(--color-upload)' }, formatBytes(c.sent_rate) + '/s')
+                    ]);
+                    connsBody.appendChild(row);
+                });
+            }
+        }
+
+        function displayRealtimeAlertNotification(alert) {
+            // Auto append or show banner
+            const alertsContainer = document.getElementById('alerts-container');
+            const empty = alertsContainer.querySelector('.empty-state');
+            if (empty) {
+                alertsContainer.replaceChildren();
+            }
+            
+            const timeStr = new Date(alert.timestamp * 1000).toLocaleTimeString();
+            const textDiv = el('div', {}, [
+                el('div', { class: 'alert-item-title' }, `Exceeded alert on [${alert.process_name}]`),
+                el('div', { style: 'font-size: 13px; margin-bottom: 5px;' }, alert.message),
+                el('span', { class: 'alert-item-time' }, timeStr)
+            ]);
+            const badge = el('span', { class: 'badge badge-upload' }, alert.severity);
+            const alertItem = el('div', { class: `alert-item severity-${alert.severity.toLowerCase()}` }, [textDiv, badge]);
+            
+            alertsContainer.insertBefore(alertItem, alertsContainer.firstChild);
+        }
+
+        // Status queries
+        async function updateSystemStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const status = await res.json();
+                
+                document.getElementById('sys-uptime').textContent = formatUptime(status.uptime);
+                document.getElementById('sys-dbsize').textContent = formatBytes(status.database_size_bytes);
+                document.getElementById('sys-sockets').textContent = status.active_sockets_count;
+                if (status.session_total_bytes !== undefined) {
+                    sessionTotalTraffic = status.session_total_bytes;
+                    document.getElementById('stat-total-session').textContent = formatBytes(sessionTotalTraffic);
+                }
+            } catch (err) {
+                console.error("Failed to query status", err);
+            }
+        }
+
+        function formatUptime(seconds) {
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            const s = seconds % 60;
+            return `${h}h ${m}m ${s}s`;
+        }
+
+        // Database queries (History Tab)
+        async function queryHistory() {
+            const range = document.getElementById('history-range-select').value;
+            const title = document.getElementById('history-consumers-title');
+            
+            let labelRange = "Last 24 Hours";
+            if (range === '7d') labelRange = "Last 7 Days";
+            else if (range === '30d') labelRange = "Last 30 Days";
+            else if (range === 'all') labelRange = "All Time";
+            title.textContent = `Top Bandwidth Consumers (${labelRange})`;
+
+            const body = document.getElementById('history-table-body');
+            body.replaceChildren();
+            body.appendChild(el('tr', {}, [el('td', { colspan: '6', class: 'empty-state' }, 'Loading data from sqlite...')]));
+
+            try {
+                const res = await fetch(`/api/top?range=${range}`);
+                const data = await res.json();
+                
+                body.replaceChildren();
+                if (data.length === 0) {
+                    body.appendChild(el('tr', {}, [el('td', { colspan: '6', class: 'empty-state' }, 'No historical records found for this range.')]));
+                } else {
+                    data.forEach(row => {
+                        const tr = el('tr', {}, [
+                            el('td', { class: 'font-mono', style: 'font-weight:600' }, row.name),
+                            el('td', {}, row.user),
+                            el('td', {}, row.container ? el('span', { class: 'badge badge-container' }, row.container) : '-'),
+                            el('td', { class: 'font-mono', style: 'color: var(--color-download)' }, formatBytes(row.recv)),
+                            el('td', { class: 'font-mono', style: 'color: var(--color-upload)' }, formatBytes(row.sent)),
+                            el('td', { class: 'font-mono', style: 'font-weight:700' }, formatBytes(row.total))
+                        ]);
+                        body.appendChild(tr);
+                    });
+                }
+            } catch (err) {
+                body.replaceChildren();
+                body.appendChild(el('tr', {}, [el('td', { colspan: '6', class: 'empty-state', style: 'color: var(--color-warning)' }, 'Failed to load data.')]));
+            }
+        }
+
+        function triggerExport(format) {
+            const range = document.getElementById('history-range-select').value;
+            window.location.href = `/api/export?range=${range}&format=${format}`;
+        }
+
+        // Alerts query
+        async function queryAlerts() {
+            const container = document.getElementById('alerts-container');
+            container.replaceChildren();
+            container.appendChild(el('div', { class: 'empty-state' }, 'Loading alerts...'));
+
+            try {
+                const res = await fetch('/api/alerts');
+                const data = await res.json();
+                container.replaceChildren();
+                
+                if (data.length === 0) {
+                    container.appendChild(el('div', { class: 'empty-state' }, 'No anomalies detected in the database.'));
+                } else {
+                    data.forEach(alert => {
+                        const timeStr = new Date(alert.timestamp * 1000).toLocaleString();
+                        const textDiv = el('div', {}, [
+                            el('div', { class: 'alert-item-title' }, `Anomalous activity on [${alert.process_name}]`),
+                            el('div', { style: 'font-size: 13px; margin-bottom: 5px;' }, alert.message),
+                            el('span', { class: 'alert-item-time' }, timeStr)
+                        ]);
+                        const badge = el('span', { class: `badge ${alert.severity === 'WARNING' ? 'badge-upload' : 'badge-download'}` }, alert.severity);
+                        const alertItem = el('div', { class: `alert-item severity-${alert.severity.toLowerCase()}` }, [textDiv, badge]);
+                        container.appendChild(alertItem);
+                    });
+                }
+            } catch (err) {
+                container.replaceChildren();
+                container.appendChild(el('div', { class: 'empty-state', style: 'color: var(--color-warning)' }, 'Failed to fetch alert logs.'));
+            }
+        }
+
+        // Settings query & save
+        async function querySettings() {
+            try {
+                const res = await fetch('/api/settings');
+                const settings = await res.json();
+                
+                document.getElementById('setting-threshold').value = settings.alert_threshold_mb_s;
+                
+                const checkUnknown = document.getElementById('setting-check-unknown');
+                checkUnknown.checked = settings.check_unknown_process;
+                
+                document.getElementById('group-unknown-threshold').style.display = settings.check_unknown_process ? 'flex' : 'none';
+                document.getElementById('setting-unknown-threshold').value = settings.alert_unknown_process_threshold_mb_s;
+            } catch (err) {
+                console.error("Failed to load settings", err);
+            }
+        }
+
+        async function saveSettings() {
+            const threshold = parseFloat(document.getElementById('setting-threshold').value);
+            const checkUnknown = document.getElementById('setting-check-unknown').checked;
+            const unknownThreshold = parseFloat(document.getElementById('setting-unknown-threshold').value);
+
+            const payload = {
+                alert_threshold_mb_s: threshold,
+                check_unknown_process: checkUnknown,
+                alert_unknown_process_threshold_mb_s: unknownThreshold
+            };
+
+            try {
+                const res = await fetch('/api/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                if (res.ok) {
+                    alert("Settings saved successfully.");
+                } else {
+                    alert("Failed to save settings.");
+                }
+            } catch (err) {
+                alert("Error connecting to backend API.");
+            }
+        }
+    </script>
+</body>
+</html>
+"""
+
+# Global program boot timer
+start_time = int(time.time())
+
+if __name__ == "__main__":
+    # Check root privileges and auto-escalate with sudo if not root
+    if os.getuid() != 0:
+        if "--mock" in sys.argv or os.environ.get("NETMON_MOCK") == "1":
+            logger.warning("NetMon is not running as root, but mock mode is requested. Starting in mock mode.")
+        else:
+            logger.info("NetMon must be executed with root privileges. Re-running with sudo...")
+            script_path = os.path.abspath(sys.argv[0])
+            args = [arg for arg in sys.argv[1:] if arg != "--mock"]
+            try:
+                os.execvp("sudo", ["sudo", sys.executable, script_path, *args])
+            except Exception as e:
+                logger.critical(f"Failed to auto-escalate privileges using sudo: {e}. Please run manually: sudo {sys.argv[0]}")
+                sys.exit(1)
+                
+    logger.info("Initializing Application Network Monitor (NetMon)...")
+    
+    # Fire up background threads
+    t_sniff = threading.Thread(target=packet_sniff_loop, name="Sniffer", daemon=True)
+    t_socks = threading.Thread(target=socket_scanner_loop, name="SockScanner", daemon=True)
+    t_proc = threading.Thread(target=proc_scanner_loop, name="ProcScanner", daemon=True)
+    t_agg = threading.Thread(target=aggregator_loop, name="Aggregator", daemon=True)
+    t_roll = threading.Thread(target=rollup_loop, name="RollupAgent", daemon=True)
+    
+    t_sniff.start()
+    t_socks.start()
+    t_proc.start()
+    t_agg.start()
+    t_roll.start()
+    
+    try:
+        # Start FastAPI Uvicorn Server (Listen on all interfaces to allow external access)
+        import uvicorn
+        logger.info("Starting web dashboard engine on http://0.0.0.0:3005")
+        uvicorn.run(app, host="0.0.0.0", port=3005, log_level="warning")
+    except KeyboardInterrupt:
+        logger.info("Shutdown initiated via keyboard interrupt.")
+    finally:
+        # Terminate background loops
+        stop_event.set()
+        proc_scan_event.set()
+        logger.info("Stopping all background services. Please wait...")
+        # Join loops with timeout
+        t_sniff.join(timeout=1.0)
+        t_socks.join(timeout=1.0)
+        t_proc.join(timeout=1.0)
+        t_agg.join(timeout=1.0)
+        t_roll.join(timeout=1.0)
+        logger.info("NetMon exited cleanly.")
